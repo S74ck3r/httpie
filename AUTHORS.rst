@@ -2,7 +2,7 @@
 HTTPie authors
 ==============
 
-* `Jakub Roztocil <https://github.com/jkbr>`_
+* `Jakub Roztocil <https://github.com/jakubroztocil>`_
 
 
 Patches and ideas
@@ -28,3 +28,6 @@ Patches and ideas
 * `Tomek Wójcik <https://github.com/tomekwojcik>`_
 * `Davey Shafik <https://github.com/dshafik>`_
 * `cido <https://github.com/cido>`_
+* `Justin Bonnar <https://github.com/jargonjustin>`_
+* `Nathan LaFreniere <https://github.com/nlf>`_
+* `Matthias Lehmann <https://github.com/matleh>`_

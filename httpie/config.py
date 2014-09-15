@@ -2,8 +2,8 @@ import os
 import json
 import errno
 
-from . import __version__
-from .compat import is_windows
+from httpie import __version__
+from httpie.compat import is_windows
 
 
 DEFAULT_CONFIG_DIR = os.environ.get(
@@ -16,31 +16,29 @@ DEFAULT_CONFIG_DIR = os.environ.get(
 class BaseConfigDict(dict):
 
     name = None
-    help = None
+    helpurl = None
     about = None
-
-    directory = DEFAULT_CONFIG_DIR
-
-    def __init__(self, directory=None, *args, **kwargs):
-        super(BaseConfigDict, self).__init__(*args, **kwargs)
-        if directory:
-            self.directory = directory
 
     def __getattr__(self, item):
         return self[item]
 
+    def _get_path(self):
+        """Return the config file path without side-effects."""
+        raise NotImplementedError()
+
     @property
     def path(self):
+        """Return the config file path creating basedir, if needed."""
+        path = self._get_path()
         try:
-            os.makedirs(self.directory, mode=0o700)
+            os.makedirs(os.path.dirname(path), mode=0o700)
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-        return os.path.join(self.directory, self.name + '.json')
+        return path
 
-    @property
     def is_new(self):
-        return not os.path.exists(self.path)
+        return not os.path.exists(self._get_path())
 
     def load(self):
         try:
@@ -61,8 +59,8 @@ class BaseConfigDict(dict):
         self['__meta__'] = {
             'httpie': __version__
         }
-        if self.help:
-            self['__meta__']['help'] = self.help
+        if self.helpurl:
+            self['__meta__']['help'] = self.helpurl
 
         if self.about:
             self['__meta__']['about'] = self.about
@@ -82,7 +80,7 @@ class BaseConfigDict(dict):
 class Config(BaseConfigDict):
 
     name = 'config'
-    help = 'https://github.com/jkbr/httpie#config'
+    helpurl = 'https://github.com/jakubroztocil/httpie#config'
     about = 'HTTPie configuration file'
 
     DEFAULTS = {
@@ -90,6 +88,10 @@ class Config(BaseConfigDict):
         'default_options': []
     }
 
-    def __init__(self, *args, **kwargs):
-        super(Config, self).__init__(*args, **kwargs)
+    def __init__(self, directory=DEFAULT_CONFIG_DIR):
+        super(Config, self).__init__()
         self.update(self.DEFAULTS)
+        self.directory = directory
+
+    def _get_path(self):
+        return os.path.join(self.directory, self.name + '.json')

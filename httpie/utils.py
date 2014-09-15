@@ -1,33 +1,29 @@
-"""
-Author: Doug Latornell
-Licence: MIT
-URL: http://code.activestate.com/recipes/577081/
-
-"""
 from __future__ import division
-import doctest
 
 
 def humanize_bytes(n, precision=2):
+    # Author: Doug Latornell
+    # Licence: MIT
+    # URL: http://code.activestate.com/recipes/577081/
     """Return a humanized string representation of a number of bytes.
 
     Assumes `from __future__ import division`.
 
     >>> humanize_bytes(1)
-    '1 byte'
-    >>> humanize_bytes(1024)
+    '1 B'
+    >>> humanize_bytes(1024, precision=1)
     '1.0 kB'
-    >>> humanize_bytes(1024 * 123)
+    >>> humanize_bytes(1024 * 123, precision=1)
     '123.0 kB'
-    >>> humanize_bytes(1024 * 12342)
+    >>> humanize_bytes(1024 * 12342, precision=1)
     '12.1 MB'
-    >>> humanize_bytes(1024 * 12342, 2)
+    >>> humanize_bytes(1024 * 12342, precision=2)
     '12.05 MB'
-    >>> humanize_bytes(1024 * 1234, 2)
+    >>> humanize_bytes(1024 * 1234, precision=2)
     '1.21 MB'
-    >>> humanize_bytes(1024 * 1234 * 1111, 2)
+    >>> humanize_bytes(1024 * 1234 * 1111, precision=2)
     '1.31 GB'
-    >>> humanize_bytes(1024 * 1234 * 1111, 1)
+    >>> humanize_bytes(1024 * 1234 * 1111, precision=1)
     '1.3 GB'
 
     """
@@ -37,18 +33,16 @@ def humanize_bytes(n, precision=2):
         (1 << 30, 'GB'),
         (1 << 20, 'MB'),
         (1 << 10, 'kB'),
-        (1, 'bytes')
+        (1, 'B')
     ]
 
     if n == 1:
-        return '1 byte'
+        return '1 B'
 
     for factor, suffix in abbrevs:
         if n >= factor:
             break
 
+    # noinspection PyUnboundLocalVariable
     return '%.*f %s' % (precision, n / factor, suffix)
 
-
-if __name__ == '__main__':
-    doctest.testmod()

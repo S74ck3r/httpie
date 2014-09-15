@@ -1,0 +1,5 @@
+tox
+pytest
+pytest-cov
+pytest-httpbin
+docutils

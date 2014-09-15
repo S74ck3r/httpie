@@ -5,21 +5,20 @@ import os
 import sys
 import re
 import json
+import errno
 import mimetypes
 import getpass
 from io import BytesIO
+from collections import namedtuple
+#noinspection PyCompatibility
 from argparse import ArgumentParser, ArgumentTypeError, ArgumentError
 
-try:
-    from collections import OrderedDict
-except ImportError:
-    OrderedDict = dict
-
 # TODO: Use MultiDict for headers once added to `requests`.
-# https://github.com/jkbr/httpie/issues/130
+# https://github.com/jakubroztocil/httpie/issues/130
 from requests.structures import CaseInsensitiveDict
 
-from .compat import urlsplit, str
+from httpie.compat import OrderedDict, urlsplit, str
+from httpie.sessions import VALID_SESSION_NAME_PATTERN
 
 
 HTTP_POST = 'POST'
@@ -35,22 +34,40 @@ SEP_PROXY = ':'
 SEP_DATA = '='
 SEP_DATA_RAW_JSON = ':='
 SEP_FILES = '@'
+SEP_DATA_EMBED_FILE = '=@'
+SEP_DATA_EMBED_RAW_JSON_FILE = ':=@'
 SEP_QUERY = '=='
 
 # Separators that become request data
 SEP_GROUP_DATA_ITEMS = frozenset([
     SEP_DATA,
     SEP_DATA_RAW_JSON,
-    SEP_FILES
+    SEP_FILES,
+    SEP_DATA_EMBED_FILE,
+    SEP_DATA_EMBED_RAW_JSON_FILE
+])
+
+# Separators for items whose value is a filename to be embedded
+SEP_GROUP_DATA_EMBED_ITEMS = frozenset([
+    SEP_DATA_EMBED_FILE,
+    SEP_DATA_EMBED_RAW_JSON_FILE,
+])
+
+# Separators for raw JSON items
+SEP_GROUP_RAW_JSON_ITEMS = frozenset([
+    SEP_DATA_RAW_JSON,
+    SEP_DATA_EMBED_RAW_JSON_FILE,
 ])
 
 # Separators allowed in ITEM arguments
-SEP_GROUP_ITEMS = frozenset([
+SEP_GROUP_ALL_ITEMS = frozenset([
     SEP_HEADERS,
     SEP_QUERY,
     SEP_DATA,
     SEP_DATA_RAW_JSON,
-    SEP_FILES
+    SEP_FILES,
+    SEP_DATA_EMBED_FILE,
+    SEP_DATA_EMBED_RAW_JSON_FILE,
 ])
 
 
@@ -107,19 +124,28 @@ class Parser(ArgumentParser):
         # Arguments processing and environment setup.
         self._apply_no_options(no_options)
         self._apply_config()
-        self._setup_standard_streams()
         self._validate_download_options()
+        self._setup_standard_streams()
         self._process_output_options()
         self._process_pretty_options()
         self._guess_method()
         self._parse_items()
-        if not env.stdin_isatty:
+        if not self.args.ignore_stdin and not env.stdin_isatty:
             self._body_from_file(self.env.stdin)
-        if not (self.args.url.startswith(HTTP)
-                or self.args.url.startswith(HTTPS)):
-            # Default to 'https://' if invoked as `https args`.
-            scheme = HTTPS if self.env.progname == 'https' else HTTP
-            self.args.url = scheme + self.args.url
+        if not (self.args.url.startswith((HTTP, HTTPS))):
+            scheme = HTTP
+
+            # See if we're using curl style shorthand for localhost (:3000/foo)
+            shorthand = re.match(r'^:(?!:)(\d*)(/?.*)$', self.args.url)
+            if shorthand:
+                port = shorthand.group(1)
+                rest = shorthand.group(2)
+                self.args.url = scheme + 'localhost'
+                if port:
+                    self.args.url += ':' + port
+                self.args.url += rest
+            else:
+                self.args.url = scheme + self.args.url
         self._process_auth()
 
         return self.args
@@ -132,7 +158,8 @@ class Parser(ArgumentParser):
             sys.stderr: self.env.stderr,
             None: self.env.stderr
         }.get(file, file)
-
+        if not hasattr(file, 'buffer') and isinstance(message, str):
+            message = message.encode(self.env.stdout_encoding)
         super(Parser, self)._print_message(message, file)
 
     def _setup_standard_streams(self):
@@ -140,7 +167,14 @@ class Parser(ArgumentParser):
         Modify `env.stdout` and `env.stdout_isatty` based on args, if needed.
 
         """
+        if not self.env.stdout_isatty and self.args.output_file:
+            self.error('Cannot use --output, -o with redirected output.')
+
         if self.args.download:
+            # FIXME: Come up with a cleaner solution.
+            if not self.env.stdout_isatty:
+                # Use stdout as the download output file.
+                self.args.output_file = self.env.stdout
             # With `--download`, we write everything that would normally go to
             # `stdout` to `stderr` instead. Let's replace the stream so that
             # we don't have to use many `if`s throughout the codebase.
@@ -152,8 +186,14 @@ class Parser(ArgumentParser):
             # `stdout`. The file is opened for appending, which isn't what
             # we want in this case.
             self.args.output_file.seek(0)
-            self.args.output_file.truncate()
-
+            try:
+                self.args.output_file.truncate()
+            except IOError as e:
+                if e.errno == errno.EINVAL:
+                    # E.g. /dev/null on Linux.
+                    pass
+                else:
+                    raise
             self.env.stdout = self.args.output_file
             self.env.stdout_isatty = False
 
@@ -173,11 +213,15 @@ class Parser(ArgumentParser):
         if self.args.auth:
             if not self.args.auth.has_password():
                 # Stdin already read (if not a tty) so it's save to prompt.
+                if self.args.ignore_stdin:
+                    self.error('Unable to prompt for passwords because'
+                               ' --ignore-stdin is set.')
                 self.args.auth.prompt_password(url.netloc)
 
         elif url.username is not None:
             # Handle http://username:password@hostname/
-            username, password = url.username, url.password
+            username = url.username
+            password = url.password or ''
             self.args.auth = AuthCredentials(
                 key=username,
                 value=password,
@@ -230,7 +274,7 @@ class Parser(ArgumentParser):
         if self.args.method is None:
             # Invoked as `http URL'.
             assert not self.args.items
-            if not self.env.stdin_isatty:
+            if not self.args.ignore_stdin and not self.env.stdin_isatty:
                 self.args.method = HTTP_POST
             else:
                 self.args.method = HTTP_GET
@@ -241,23 +285,22 @@ class Parser(ArgumentParser):
             # and the first ITEM is now incorrectly in `args.url`.
             try:
                 # Parse the URL as an ITEM and store it as the first ITEM arg.
-                self.args.items.insert(
-                    0,
-                    KeyValueArgType(*SEP_GROUP_ITEMS).__call__(self.args.url)
-                )
+                self.args.items.insert(0, KeyValueArgType(
+                    *SEP_GROUP_ALL_ITEMS).__call__(self.args.url))
 
             except ArgumentTypeError as e:
                 if self.args.traceback:
                     raise
-                self.error(e.message)
+                self.error(e.args[0])
 
             else:
                 # Set the URL correctly
                 self.args.url = self.args.method
                 # Infer the method
-                has_data = not self.env.stdin_isatty or any(
-                    item.sep in SEP_GROUP_DATA_ITEMS
-                    for item in self.args.items
+                has_data = (
+                    (not self.args.ignore_stdin and not self.env.stdin_isatty)
+                     or any(item.sep in SEP_GROUP_DATA_ITEMS
+                            for item in self.args.items)
                 )
                 self.args.method = HTTP_POST if has_data else HTTP_GET
 
@@ -280,7 +323,7 @@ class Parser(ArgumentParser):
         except ParseError as e:
             if self.args.traceback:
                 raise
-            self.error(e.message)
+            self.error(e.args[0])
 
         if self.args.files and not self.args.form:
             # `http url @/path/to/file`
@@ -363,25 +406,19 @@ class KeyValue(object):
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
 
-
-def session_name_arg_type(name):
-    from .sessions import Session
-    if not Session.is_valid_name(name):
-        raise ArgumentTypeError(
-            'special characters and spaces are not'
-            ' allowed in session names: "%s"'
-            % name)
-    return name
+    def __repr__(self):
+        return repr(self.__dict__)
 
 
-class RegexValidator(object):
+class SessionNameValidator(object):
 
-    def __init__(self, pattern, error_message):
-        self.pattern = re.compile(pattern)
+    def __init__(self, error_message):
         self.error_message = error_message
 
     def __call__(self, value):
-        if not self.pattern.search(value):
+        # Session name can be a path or just a name.
+        if (os.path.sep not in value
+                and not VALID_SESSION_NAME_PATTERN.search(value)):
             raise ArgumentError(None, self.error_message)
         return value
 
@@ -398,6 +435,9 @@ class KeyValueArgType(object):
 
     def __init__(self, *separators):
         self.separators = separators
+        self.special_characters = set('\\')
+        for separator in separators:
+            self.special_characters.update(separator)
 
     def __call__(self, string):
         """Parse `string` and return `self.key_value_class()` instance.
@@ -416,21 +456,22 @@ class KeyValueArgType(object):
             """Tokenize `s`. There are only two token types - strings
             and escaped characters:
 
-            >>> tokenize(r'foo\=bar\\baz')
-            ['foo', Escaped('='), 'bar', Escaped('\\'), 'baz']
+            tokenize(r'foo\=bar\\baz')
+            => ['foo', Escaped('='), 'bar', Escaped('\\'), 'baz']
 
             """
+            backslash = '\\'
             tokens = ['']
-            esc = False
+            s = iter(s)
             for c in s:
-                if esc:
-                    tokens.extend([Escaped(c), ''])
-                    esc = False
-                else:
-                    if c == '\\':
-                        esc = True
+                if c == backslash:
+                    nc = next(s, '')
+                    if nc in self.special_characters:
+                        tokens.extend([Escaped(nc), ''])
                     else:
-                        tokens[-1] += c
+                        tokens[-1] += c + nc
+                else:
+                    tokens[-1] += c
             return tokens
 
         tokens = tokenize(string)
@@ -467,7 +508,7 @@ class KeyValueArgType(object):
 
         else:
             raise ArgumentTypeError(
-                '"%s" is not a valid value' % string)
+                u'"%s" is not a valid value' % string)
 
         return self.key_value_class(
             key=key, value=value, sep=sep, orig=string)
@@ -535,6 +576,10 @@ class ParamDict(OrderedDict):
             self[key].append(value)
 
 
+RequestItems = namedtuple('RequestItems',
+                          ['headers', 'data', 'files', 'params'])
+
+
 def parse_items(items, data=None, headers=None, files=None, params=None):
     """Parse `KeyValue` `items` into `data`, `headers`, `files`,
     and `params`.
@@ -550,9 +595,7 @@ def parse_items(items, data=None, headers=None, files=None, params=None):
         params = ParamDict()
 
     for item in items:
-
         value = item.value
-        key = item.key
 
         if item.sep == SEP_HEADERS:
             target = headers
@@ -564,21 +607,42 @@ def parse_items(items, data=None, headers=None, files=None, params=None):
                     value = (os.path.basename(value),
                              BytesIO(f.read()))
             except IOError as e:
-                raise ParseError(
-                    'Invalid argument "%s": %s' % (item.orig, e))
+                raise ParseError('"%s": %s' % (item.orig, e))
             target = files
 
-        elif item.sep in [SEP_DATA, SEP_DATA_RAW_JSON]:
-            if item.sep == SEP_DATA_RAW_JSON:
+        elif item.sep in SEP_GROUP_DATA_ITEMS:
+
+            if item.sep in SEP_GROUP_DATA_EMBED_ITEMS:
                 try:
-                    value = json.loads(item.value)
-                except ValueError:
-                    raise ParseError('"%s" is not valid JSON' % item.orig)
+                    with open(os.path.expanduser(value), 'rb') as f:
+                        value = f.read().decode('utf8')
+                except IOError as e:
+                    raise ParseError('"%s": %s' % (item.orig, e))
+                except UnicodeDecodeError:
+                    raise ParseError(
+                        '"%s": cannot embed the content of "%s",'
+                        ' not a UTF8 or ASCII-encoded text file'
+                        % (item.orig, item.value)
+                    )
+
+            if item.sep in SEP_GROUP_RAW_JSON_ITEMS:
+                try:
+                    value = json.loads(value)
+                except ValueError as e:
+                    raise ParseError('"%s": %s' % (item.orig, e))
             target = data
 
         else:
             raise TypeError(item)
 
-        target[key] = value
+        target[item.key] = value
 
-    return headers, data, files, params
+    return RequestItems(headers, data, files, params)
+
+
+def readable_file_arg(filename):
+    try:
+        open(filename, 'rb')
+    except IOError as ex:
+        raise ArgumentTypeError('%s: %s' % (filename, ex.args[1]))
+    return filename

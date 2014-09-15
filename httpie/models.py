@@ -1,58 +1,4 @@
-import os
-import sys
-
-from .config import DEFAULT_CONFIG_DIR, Config
-from .compat import urlsplit, is_windows, bytes, str
-
-
-class Environment(object):
-    """Holds information about the execution context.
-
-    Groups various aspects of the environment in a changeable object
-    and allows for mocking.
-
-    """
-
-    is_windows = is_windows
-
-    progname = os.path.basename(sys.argv[0])
-    if progname not in ['http', 'https']:
-        progname = 'http'
-
-    config_dir = DEFAULT_CONFIG_DIR
-
-    # Can be set to 0 to disable colors completely.
-    colors = 256 if '256color' in os.environ.get('TERM', '') else 88
-
-    stdin = sys.stdin
-    stdin_isatty = sys.stdin.isatty()
-
-    stdout_isatty = sys.stdout.isatty()
-    if stdout_isatty and is_windows:
-        # noinspection PyUnresolvedReferences
-        from colorama.initialise import wrap_stream
-        stdout = wrap_stream(sys.stdout, convert=None,
-                             strip=None, autoreset=True, wrap=True)
-    else:
-        stdout = sys.stdout
-
-    stderr = sys.stderr
-    stderr_isatty = sys.stderr.isatty()
-
-    def __init__(self, **kwargs):
-        assert all(hasattr(type(self), attr)
-                   for attr in kwargs.keys())
-        self.__dict__.update(**kwargs)
-
-    @property
-    def config(self):
-        if not hasattr(self, '_config'):
-            self._config = Config(directory=self.config_dir)
-            if self._config.is_new:
-                self._config.save()
-            else:
-                self._config.load()
-        return self._config
+from httpie.compat import urlsplit, str
 
 
 class HTTPMessage(object):
@@ -88,8 +34,8 @@ class HTTPMessage(object):
     def content_type(self):
         """Return the message content type."""
         ct = self._orig.headers.get('Content-Type', '')
-        if isinstance(ct, bytes):
-            ct = ct.decode()
+        if not isinstance(ct, str):
+            ct = ct.decode('utf8')
         return ct
 
 
@@ -102,11 +48,13 @@ class HTTPResponse(HTTPMessage):
     def iter_lines(self, chunk_size):
         return ((line, b'\n') for line in self._orig.iter_lines(chunk_size))
 
+    #noinspection PyProtectedMember
     @property
     def headers(self):
         original = self._orig.raw._original_response
+        version = {9: '0.9', 10: '1.0', 11: '1.1'}[original.version]
         status_line = 'HTTP/{version} {status} {reason}'.format(
-            version='.'.join(str(original.version)),
+            version=version,
             status=original.status,
             reason=original.reason
         )
@@ -154,16 +102,24 @@ class HTTPRequest(HTTPMessage):
         )
 
         headers = dict(self._orig.headers)
+        if 'Host' not in self._orig.headers:
+            headers['Host'] = url.netloc.split('@')[-1]
 
-        if 'Host' not in headers:
-            headers['Host'] = url.netloc
-
-        headers = ['%s: %s' % (name, value)
-                   for name, value in headers.items()]
+        headers = [
+            '%s: %s' % (
+                name,
+                value if isinstance(value, str) else value.decode('utf8')
+            )
+            for name, value in headers.items()
+        ]
 
         headers.insert(0, request_line)
+        headers = '\r\n'.join(headers).strip()
 
-        return '\r\n'.join(headers).strip()
+        if isinstance(headers, bytes):
+            # Python < 3
+            headers = headers.decode('utf8')
+        return headers
 
     @property
     def encoding(self):
